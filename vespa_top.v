@@ -1,14 +1,24 @@
+`define TRACE_PC
+`define TRACE_CC
+`define TRACE_REGS
+
 module vespa;
+   
+
    
    //global definitions
    parameter WIDTH = 32;
    parameter NUMREGS = 32;
    parameter MEMSIZE = (1 << 13); //  0 to (2^13 -1) memory location. MEMSIZE = 8192
+   parameter STACK_BASE = MEMSIZE-1;
+   parameter STACK_SIZE = MEMSIZE >> 4;
+   
+   
 
-   // Memory declaration
+   // Memory and registers declaration
 
-   reg [7:0] MEM[NUMREG-1 : 0];
-   reg [WIDTH-1:0] R[NUMREG-1 : 0];
+   reg [7:0] MEM[NUMREGS-1 : 0];
+   reg [WIDTH-1:0] R[NUMREGS-1 : 0];
    reg [WIDTH-1:0] PC;
    reg [WIDTH-1:0] IR;
    reg 		   C;
@@ -17,6 +27,14 @@ module vespa;
    reg 		   N;
    reg 		   RUN;
 
+   // Stack Declaration
+   
+   reg [WIDTH-1:0] TOP; //pointer to top of stack
+   reg 		   STACK_EMPTY;
+   reg 		   STACK_FULL;
+   
+   //stack used decrements top pointer memory when pushed, and increaments memory when popped
+   
    // For ALU
 
    reg [WIDTH-1:0] op1;
@@ -41,7 +59,8 @@ module vespa;
 `define ST 'd13
 `define STX 'd14
 `define HLT 'd15
-
+`define PUSH 'd16
+`define POP 'd17
    // defines for BXX
 
 `define BRA 'b0000 
@@ -81,6 +100,10 @@ initial begin
 
    RUN = 1; //gets reset by HLT
    PC = 0;
+   
+   TOP = STACK_BASE;
+   STACK_EMPTY = 'd1;
+   
    num_instrns = 0;
 
    while(RUN == 1) begin
@@ -90,7 +113,7 @@ initial begin
       print_trace;
    end
 
-   $display("\n Total number of instructions executed: %d\n\n",num_instrs);
+   $display("\n Total number of instructions executed: %d\n\n",num_instrns);
    $finish;
 
 end // initial begin
@@ -102,8 +125,7 @@ function [WIDTH-1:0] read_mem;
    begin
       read_mem = {MEM[addr], MEM[addr+1], MEM[addr+2], MEM[addr+3]};
    end
-endfunction //
-   
+endfunction //   
    
 function check_cond;
    input 		Z;
@@ -130,17 +152,33 @@ function check_cond;
    endcase // case (`COND)
 endfunction // check_cond
    
+task print_trace;
+   integer i;
+   integer j;
+   begin
+`ifdef TRACE_PC
+      $display("Instruction #%d\t PC=%h\t OpCode=%d",num_instrns,PC,`OPCODE);
+`endif
+      
+`ifdef TRACE_CC
+      $display("Flags are\n C=%d,V=%d,Z=%d,N=%d",C,V,Z,N);
+`endif
+      
+`ifdef TRACE_REGS
+      for(i=0;i<NUMREGS;i=i+1) begin
+	 $display("Regsiter &d = %h\n",i,R[i]);
+      end
+`endif
+   end
+endtask // print_trace
    
-task write_mem; //for generic use with 8, 16 and 32 bit mem writes
+
+   
+task write_mem;
    input [WIDTH-1:0] addr;
    input [WIDTH-1:0] data;
-   integer 	     i;
-   integer 	     j;
    begin
-      i = WIDTH / 8;
-      for(j=0;j<i;j=j+1) begin
-	 MEM[addr+(i-j-1)] = data[(j*8):((j*8) + 8)-1];
-      end
+      {MEM[addr],MEM[addr+1],MEM[addr+2],MEM[addr+3]} = data;
    end
 endtask // write_mem
    
@@ -161,19 +199,25 @@ endtask // setcc
    
      
 function [WIDTH-1:0] sign_ext16;
-   input [15:0] 	data;
-   sign_ext16 = {{16{data[15]}},data};
+   input [15:0] 	num;
+   sign_ext16 = {{16{num[15]}},num};
 endfunction //
       
 function [WIDTH-1:0] sign_ext17;
    input [16:0] 	num;
-   sign_ext17 = {{15{data[16]}},num};
+   sign_ext17 = {{15{num[16]}},num};
 endfunction //
 
 function [WIDTH-1:0] sign_ext22;
    input [21:0] 	num;
    sign_ext22 = {{10{num[21]}},num};
 endfunction // read_mem
+
+function [WIDTH-1:0] sign_ext23;
+   input [22:0] 	num;
+   sign_ext23 = {{11{num[22]}},num};
+endfunction // read_mem
+   
    
 /********************************************************************/   
 task fetch;
@@ -184,14 +228,16 @@ task fetch;
 endtask // fetch
    
 task execute;
-   reg temp[WIDTH-1:0];
+   reg [WIDTH-1:0] temp32;
+   reg [7:0] 	   temp8;
+   
    begin
       case (`OPCODE)
 	`ADD : begin
 	   if(`IMM_OP == 'd0)
 	     op2 = R[`rs2];
 	   else
-	     op2 = sign_ext16(immed16);
+	     op2 = sign_ext16(`immed16);
 	   op1 = R[`rs1];
 	   result = op1 + op2;
 	   R[`rdst] = result[WIDTH-1:0];
@@ -282,9 +328,9 @@ task execute;
 	
 	`ST : begin
 	   
-	   temp = sign_ext22(`immed22);
+	   temp32 = sign_ext22(`immed22);
 	   
-	   write_mem(temp,R[`rdst]); //write mem is a task. so it seems I cant put sign_ext22 as an arg
+	   write_mem(temp32,R[`rdst]); //write mem is a task. so it seems I cant put sign_ext22 as an arg
 	end
 	
 	`STX : begin
@@ -302,7 +348,41 @@ task execute;
 	   R[`rdst] = result[WIDTH-1:0];
 	   setcc(op1,op2,result,1);
 	end // case: `SUB
+
+	`PUSH : begin
+	   if(`IMM_OP == 'd1) begin // PUSH Flags instruction
+	      write_mem(TOP,{4'b0000,Z,C,N,V});
+	      if(STACK_EMPTY == 'd0)
+		TOP = TOP - 'd1;
+	   end
+	   //normal push instruction.
+	   if(STACK_EMPTY == 'd0) begin
+	      TOP = TOP + 'd4;
+	   end
+	   else
+	      TOP = TOP + 'd3;    
+	   {MEM[TOP-3],MEM[TOP-2],MEM[TOP-1],MEM[TOP]} = R[`rdst];   
+	end // case: `PUSH
 	
+	`POP  :begin
+	   if(`IMM_OP == 'd1) begin //POP Flags insn
+	      if(TOP == STACK_BASE)
+		STACK_EMPTY = 'd1;
+	      else
+		TOP = TOP + 'd1;
+	      temp8 = MEM[TOP];
+	      {Z,C,N,V} = temp8[3:0];
+	   end
+	   //normal pop insn
+	   temp32 = read_mem(TOP);
+	   if(STACK_BASE+3 == TOP) begin 
+	     STACK_EMPTY = 'd1;
+	     TOP = STACK_BASE;
+	   end
+	   else
+	     TOP = TOP + 4;
+	end
+ 
 	default: $display("Undefined OpCode %d",`OPCODE);
       endcase // case (`OPCODE)
    end
