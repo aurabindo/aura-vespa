@@ -166,7 +166,7 @@ task print_trace;
       
 `ifdef TRACE_REGS
       for(i=0;i<NUMREGS;i=i+1) begin
-	 $display("Regsiter &d = %h\n",i,R[i]);
+	 $display("Regsiter %d = %h\n",i,R[i]);
       end
 `endif
    end
